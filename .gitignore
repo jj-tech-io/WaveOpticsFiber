@@ -1,2 +1,3 @@
 build/
 hankeldouble/
+*.pyc
