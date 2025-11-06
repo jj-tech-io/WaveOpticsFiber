@@ -313,7 +313,14 @@ class BEMSolver:
                                     self.background.eps1/self.background.mu1 * inside)
         
         # Z-T coupling
-        c = np.cross(R, g2 * tan2)
+        # Manual cross product
+        tan2_g2 = np.asarray(tan2) * g2
+        R_arr = np.asarray(R)
+        c = np.array([
+            R_arr[1] * tan2_g2[2] - R_arr[2] * tan2_g2[1],
+            R_arr[2] * tan2_g2[0] - R_arr[0] * tan2_g2[2],
+            R_arr[0] * tan2_g2[1] - R_arr[1] * tan2_g2[0]
+        ])
         common1 = 1j / 4 * const1 * f1 * const2
         
         self.Z[n+b1, 2*n+b2] += common1 * (self.wave.newk * temp2 * c[2] +
@@ -322,7 +329,15 @@ class BEMSolver:
                                           self.wave.newk1 * temp4 * c[2])
         
         # T-Z coupling
-        cdot = np.dot(tan1, np.cross(R, z_vec * f2))
+        # Manual cross product to avoid NumPy internal variable conflicts
+        z_vec_f2 = np.asarray(z_vec) * f2
+        R_arr = np.asarray(R)
+        cross_result = np.array([
+            R_arr[1] * z_vec_f2[2] - R_arr[2] * z_vec_f2[1],
+            R_arr[2] * z_vec_f2[0] - R_arr[0] * z_vec_f2[2],
+            R_arr[0] * z_vec_f2[1] - R_arr[1] * z_vec_f2[0]
+        ])
+        cdot = np.dot(tan1, cross_result)
         
         self.Z[b1, 3*n+b2] += common1 * (self.wave.newk * cdot * temp2 +
                                          self.wave.newk1 * cdot * temp4)
@@ -330,7 +345,15 @@ class BEMSolver:
                                             self.wave.newk1 * cdot * temp4)
         
         # Tangent-normal coupling
-        cdot = np.dot(tan1, np.cross(z_vec, g2 * tan2))
+        # Manual cross product
+        tan2_scaled = np.asarray(tan2) * g2
+        z_vec_arr = np.asarray(z_vec)
+        cross_result = np.array([
+            z_vec_arr[1] * tan2_scaled[2] - z_vec_arr[2] * tan2_scaled[1],
+            z_vec_arr[2] * tan2_scaled[0] - z_vec_arr[0] * tan2_scaled[2],
+            z_vec_arr[0] * tan2_scaled[1] - z_vec_arr[1] * tan2_scaled[0]
+        ])
+        cdot = np.dot(tan1, cross_result)
         outside = self.wave.kz / 4 * const1 * f1 * const2 * cdot * temp1
         inside = self.wave.kz / 4 * const1 * f1 * const2 * cdot * temp3
         
@@ -417,11 +440,14 @@ class BEMSolver:
                             if i == j:  # Same element - handle singularity
                                 # Compute singular integrals analytically
                                 if nn == 0:
-                                    xp = np.linalg.norm(p1 - self.nodes[el_i.node2])
+                                    diff_tmp = p1 - self.nodes[el_i.node2]
+                                    xp = np.sqrt(np.sum(diff_tmp * diff_tmp))
                                 else:
-                                    xp = np.linalg.norm(p1 - self.nodes[el_i.node1])
+                                    diff_tmp = p1 - self.nodes[el_i.node1]
+                                    xp = np.sqrt(np.sum(diff_tmp * diff_tmp))
                                 
-                                xp1 = np.linalg.norm(p1 - self.nodes[el_i.node1])
+                                diff_tmp = p1 - self.nodes[el_i.node1]
+                                xp1 = np.sqrt(np.sum(diff_tmp * diff_tmp))
                                 
                                 # Analytical singular integrals
                                 sing1 = (len2/2 - 2/np.pi * (xp**2/(2*len2) * np.log(xp/(len2-xp)) +
@@ -444,7 +470,7 @@ class BEMSolver:
                                 for q in range(self.quadrature):
                                     p2 = el_j.get_quadrature_point(q)
                                     diff = p1 - p2
-                                    dis = np.linalg.norm(diff)
+                                    dis = np.sqrt(np.sum(diff * diff))
                                     R = diff / dis
                                     constant2 = len2 / 2 * self.weights[q]
                                     
@@ -574,7 +600,7 @@ class BEMSolver:
                     for p in range(self.quadrature):
                         p1 = el.get_quadrature_point(p)
                         diffvec = np.array([x, y, 0]) - p1
-                        dis = np.linalg.norm(diffvec)
+                        dis = np.sqrt(np.sum(diffvec * diffvec))
                         
                         # Asymptotic Hankel function for large distances
                         hankel = np.sqrt(2j / (np.pi * self.wave.newk * dis)) * \
@@ -603,17 +629,19 @@ class BEMSolver:
         sigma *= distance / (2 * self.radius)
         return sigma
     
-    def compute_bsdf_3d(self, n_theta, n_phi, distance, verbose=False):
+    def compute_bsdf_3d(self, n_theta, n_phi, distance, verbose=False, batch_size=36):
         """
-        Compute full 3D Bidirectional Scattering Distribution Function.
+        Compute full 3D Bidirectional Scattering Distribution Function with batch processing.
         
         This computes scattering in all directions on a sphere around the cylinder.
+        Uses vectorized batch processing for efficiency.
         
         Parameters:
             n_theta (int): Number of polar angles (0 to π)
             n_phi (int): Number of azimuthal angles (0 to 2π)
             distance (float): Distance from origin to evaluate scattered field (m)
             verbose (bool): Print progress updates
+            batch_size (int): Number of phi angles to process at once (default: 36)
             
         Returns:
             tuple: (theta_array, phi_array, sigma_3d)
@@ -630,26 +658,47 @@ class BEMSolver:
         sigma_3d = np.zeros((n_theta, n_phi))
         
         if verbose:
-            print(f"    Computing 3D BSDF: {n_theta} x {n_phi} = {n_theta*n_phi} directions", end='', flush=True)
-            progress_step = max(1, n_theta // 10)
+            import sys
+            print(f"    Computing 3D BSDF: {n_theta} x {n_phi} = {n_theta*n_phi} directions")
+            print(f"    Using batch processing: {batch_size} phi angles at once")
+            progress_step = max(1, n_theta // 20)
+        
+        # Precompute z vector for reuse
+        z_vec = np.array([0, 0, 1])
         
         for i, theta_obs in enumerate(theta_array):
             if verbose and i % progress_step == 0:
-                print('.', end='', flush=True)
+                pct = int(100 * i / n_theta)
+                print(f"      Progress: {pct}% ({i}/{n_theta} theta angles)", flush=True)
             
-            for j, phi_obs in enumerate(phi_array):
-                # Observation point in spherical coordinates
-                x = distance * np.sin(theta_obs) * np.cos(phi_obs)
-                y = distance * np.sin(theta_obs) * np.sin(phi_obs)
-                z = distance * np.cos(theta_obs)
+            # Process phi angles in batches for this theta
+            for batch_start in range(0, n_phi, batch_size):
+                batch_end = min(batch_start + batch_size, n_phi)
+                phi_batch = phi_array[batch_start:batch_end]
+                n_batch = len(phi_batch)
                 
-                # Observation direction (unit vector from origin to observation point)
-                obs_dir = np.array([np.sin(theta_obs) * np.cos(phi_obs),
-                                   np.sin(theta_obs) * np.sin(phi_obs),
-                                   np.cos(theta_obs)])
+                # Vectorized observation points: shape (n_batch, 3)
+                sin_theta = np.sin(theta_obs)
+                cos_theta = np.cos(theta_obs)
+                cos_phi_batch = np.cos(phi_batch)
+                sin_phi_batch = np.sin(phi_batch)
                 
-                E = np.zeros(3, dtype=complex)
-                H = np.zeros(3, dtype=complex)
+                obs_points = np.stack([
+                    distance * sin_theta * cos_phi_batch,
+                    distance * sin_theta * sin_phi_batch,
+                    distance * cos_theta * np.ones(n_batch)
+                ], axis=1)  # shape: (n_batch, 3)
+                
+                # Observation directions (unit vectors)
+                obs_dirs = np.stack([
+                    sin_theta * cos_phi_batch,
+                    sin_theta * sin_phi_batch,
+                    cos_theta * np.ones(n_batch)
+                ], axis=1)  # shape: (n_batch, 3)
+                
+                # Initialize fields for batch: shape (n_batch, 3)
+                E_batch = np.zeros((n_batch, 3), dtype=complex)
+                H_batch = np.zeros((n_batch, 3), dtype=complex)
                 
                 # Sum contributions from all surface currents
                 for k in range(self.numel):
@@ -667,38 +716,55 @@ class BEMSolver:
                         
                         for p in range(self.quadrature):
                             p1 = el.get_quadrature_point(p)
-                            diffvec = np.array([x, y, z]) - p1
-                            dis = np.linalg.norm(diffvec)
                             
-                            # Far-field approximation: use asymptotic Hankel function
-                            hankel = np.sqrt(2j / (np.pi * self.wave.newk * dis)) * \
-                                    np.exp(-1j * self.wave.newk * dis)
+                            # Vectorized distance calculation: (n_batch, 3) - (3,) -> (n_batch, 3)
+                            diffvec = obs_points - p1[np.newaxis, :]
+                            dis_batch = np.sqrt(np.sum(diffvec * diffvec, axis=1))  # shape: (n_batch,)
+                            
+                            # Vectorized Hankel function
+                            hankel_batch = np.sqrt(2j / (np.pi * self.wave.newk * dis_batch)) * \
+                                         np.exp(-1j * self.wave.newk * dis_batch)  # shape: (n_batch,)
                             
                             common = length / 2 * self.weights[p]
-                            z_vec = np.array([0, 0, 1])
                             
                             # Contributions from J_z (z-directed current)
-                            tmp = -self.wave.omega * self.background.mu0 / 4 * common * z_vec * hankel
-                            E += J_coef_z * self.f[m, p] * tmp
-                            H += (self.background.eps0 / self.background.mu0 *
-                                 M_coef_z * self.g[m, p] * tmp)
+                            # Broadcasting: (n_batch,) * scalar * (3,) -> (n_batch, 3)
+                            tmp = -self.wave.omega * self.background.mu0 / 4 * common * \
+                                  hankel_batch[:, np.newaxis] * z_vec[np.newaxis, :]
+                            E_batch += J_coef_z * self.f[m, p] * tmp
+                            H_batch += (self.background.eps0 / self.background.mu0 *
+                                       M_coef_z * self.g[m, p] * tmp)
                             
                             # Contributions from J_t (tangential current)
-                            tmp = -self.wave.omega * self.background.mu0 / 4 * common * tanvec * hankel
-                            E += J_coef_t * self.f[m, p] * tmp
-                            H += (self.background.eps0 / self.background.mu0 *
-                                 M_coef_t * self.g[m, p] * tmp)
+                            tmp = -self.wave.omega * self.background.mu0 / 4 * common * \
+                                  hankel_batch[:, np.newaxis] * tanvec[np.newaxis, :]
+                            E_batch += J_coef_t * self.f[m, p] * tmp
+                            H_batch += (self.background.eps0 / self.background.mu0 *
+                                       M_coef_t * self.g[m, p] * tmp)
                 
-                # Remove component along propagation direction (far-field)
-                E_s = E - np.dot(obs_dir, E) * obs_dir
-                H_s = H - np.dot(obs_dir, H) * obs_dir
-                E_s += np.cross(-obs_dir, H_s) * self.background.Z0
-                
-                # Power in scattered field
-                sigma_3d[i, j] = np.abs(E_s)**2 @ np.ones(3)
+                # Process each direction in batch (vectorized projection operations)
+                for j_local, j_global in enumerate(range(batch_start, batch_end)):
+                    E = E_batch[j_local]
+                    H = H_batch[j_local]
+                    obs_dir = obs_dirs[j_local]
+                    
+                    # Remove component along propagation direction (far-field)
+                    E_s = E - np.dot(obs_dir, E) * obs_dir
+                    H_s = H - np.dot(obs_dir, H) * obs_dir
+                    
+                    # Manual cross product for -obs_dir × H_s
+                    cross = np.array([
+                        -obs_dir[1]*H_s[2] + obs_dir[2]*H_s[1],
+                        -obs_dir[2]*H_s[0] + obs_dir[0]*H_s[2],
+                        -obs_dir[0]*H_s[1] + obs_dir[1]*H_s[0]
+                    ])
+                    E_s += cross * self.background.Z0
+                    
+                    # Power in scattered field
+                    sigma_3d[i, j_global] = np.abs(E_s)**2 @ np.ones(3)
         
         if verbose:
-            print(" done")
+            print("      Progress: 100% - Complete!", flush=True)
         
         sigma_3d *= distance / (2 * self.radius)
         return theta_array, phi_array, sigma_3d

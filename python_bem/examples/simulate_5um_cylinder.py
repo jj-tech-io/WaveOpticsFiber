@@ -9,6 +9,11 @@ Parameters:
 - Azimuthal angle: phi_i = 0
 
 Uses GPU acceleration with CuPy if available.
+
+Command-line arguments:
+    --n-theta N      Number of polar angle samples for 3D BSDF (default: 36)
+    --n-phi N        Number of azimuthal angle samples for 3D BSDF (default: 72)
+    --dpi N          DPI for 3D plot output (default: 200)
 """
 import sys
 import io
@@ -17,11 +22,14 @@ if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 import sys
 import os
+import argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 # Output directory for images and data
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'output')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+# convenience variable used later (preserve existing name used in file)
+output_dir = OUTPUT_DIR
 
 import numpy as np
 import matplotlib
@@ -33,18 +41,19 @@ from bem_solver.visualization import (plot_geometry, plot_scattering_polar,
                                        plot_scattering_cartesian, plot_full_results)
 import time
 
-# Try to import CuPy for GPU acceleration
-# NOTE: CuPy support not yet implemented in solver, using NumPy for now
-try:
-    import cupy as cp
-    HAS_CUPY = True
-    print("INFO: CuPy available but not yet integrated - using NumPy (CPU only)")
-except ImportError:
-    cp = np
-    HAS_CUPY = False
-    print("INFO: Using NumPy (CPU only)")
+# CuPy GPU acceleration not yet implemented in solver - using NumPy
+print("INFO: Using NumPy (CPU only)")
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Simulate dielectric cylinder scattering')
+    parser.add_argument('--n-theta', type=int, default=36*4,
+                        help='Number of polar angle samples for 3D BSDF (default: 36)')
+    parser.add_argument('--n-phi', type=int, default=72*4,
+                        help='Number of azimuthal angle samples for 3D BSDF (default: 72)')
+    parser.add_argument('--dpi', type=int, default=400,
+                        help='DPI for 3D plot output (default: 200)')
+    args = parser.parse_args()
     print("=" * 70)
     print("Dielectric Cylinder Scattering Simulation")
     print("=" * 70)
@@ -55,12 +64,12 @@ def main():
     print(f"\nOutput directory: {output_dir}")
     
     # Simulation parameters
-    radius = 5e-6  # 5 micrometers
+    radius = 2e-6  # 5 micrometers
     n_fiber = 1.54  # Refractive index
     epsr = n_fiber**2  # Relative permittivity
     
     # Incident wave parameters
-    wavelength = 600e-9  # 600 nm
+    wavelength = 700e-9  # 600 nm
     c0 = 299792458.0
     freq = c0 / wavelength
     
@@ -165,8 +174,11 @@ def main():
     # Compute full 3D BSDF from BEM solver
     print("\n" + "-" * 70)
     print("Computing 3D scattering pattern...")
-    n_theta_3d = 36  # Polar angles (reduced for speed)
-    n_phi_3d = 72    # Azimuthal angles (reduced for speed)
+    n_theta_3d = args.n_theta  # Polar angles (from command-line)
+    n_phi_3d = args.n_phi      # Azimuthal angles (from command-line)
+    
+    # filename base for outputs
+    filename_base = f'cylinder_r{radius*1e6:.0f}um_n{n_fiber}_scattering'
     
     # Compute for TM polarization
     print("  TM polarization:")
@@ -183,6 +195,114 @@ def main():
     pdf_longitudinal = np.mean(sigma_3d_avg, axis=1)
     pdf_longitudinal = pdf_longitudinal / (np.sum(pdf_longitudinal) * (np.pi / n_theta_3d))
     theta_long = theta_3d
+
+    # --- Create LARGE standalone 3D plot (high quality) ---
+    print("\n" + "=" * 70)
+    print("CREATING HIGH-RESOLUTION 3D SCATTERING PLOT")
+    print("=" * 70)
+    from matplotlib import cm
+    
+    # Create large figure for 3D plot
+    fig_3d = plt.figure(figsize=(20, 18))
+    ax_3d = fig_3d.add_subplot(111, projection='3d')
+    
+    # Create meshgrid from computed 3D BSDF
+    phi_mesh, theta_mesh = np.meshgrid(phi_3d, theta_3d)
+    
+    # Normalize to PDF
+    d_theta = np.pi / n_theta_3d
+    d_phi = 2 * np.pi / n_phi_3d
+    pdf_3d = sigma_3d_avg / (np.sum(sigma_3d_avg) * d_theta * d_phi)
+    
+    # Scale for visualization
+    pdf_3d_scaled = pdf_3d * 5.0
+    
+    # Convert to Cartesian coordinates
+    x_3d = pdf_3d_scaled * np.sin(theta_mesh) * np.cos(phi_mesh)
+    y_3d = pdf_3d_scaled * np.sin(theta_mesh) * np.sin(phi_mesh)
+    z_3d = pdf_3d_scaled * np.cos(theta_mesh)
+    
+    # Plot surface with color map (higher quality)
+    surf = ax_3d.plot_surface(x_3d, y_3d, z_3d, cmap=cm.viridis, alpha=0.85,
+                              linewidth=0, antialiased=True, shade=True,
+                              facecolors=cm.viridis(pdf_3d / np.max(pdf_3d)),
+                              rstride=1, cstride=1)
+    
+    # Add cylinder at origin
+    ax_3d.plot([0], [0], [0], 'ro', markersize=15, label='Cylinder', zorder=100)
+    
+    # Enhanced labels and title
+    ax_3d.set_xlabel('X', fontsize=16, fontweight='bold', labelpad=12)
+    ax_3d.set_ylabel('Y', fontsize=16, fontweight='bold', labelpad=12)
+    ax_3d.set_zlabel('Z', fontsize=16, fontweight='bold', labelpad=12)
+    ax_3d.set_title(f'3D Scattering PDF (BEM computed)\n' +
+                    f'Cylinder: r={radius*1e6:.1f}μm, n={n_fiber}, λ={wavelength*1e9:.0f}nm\n' +
+                    f'Samples: {n_theta_3d}×{n_phi_3d}={n_theta_3d*n_phi_3d} directions',
+                    fontsize=18, fontweight='bold', pad=25)
+    ax_3d.view_init(elev=20, azim=45)
+    
+    # Add colorbar
+    fig_3d.colorbar(surf, ax=ax_3d, shrink=0.5, aspect=10, pad=0.1,
+                    label='Normalized Scattering Intensity')
+    
+    # Save large 3D figure with high DPI
+    filename_3d = f'cylinder_r{radius*1e6:.0f}um_n{n_fiber}_3d_scattering'
+    fig_3d_path = os.path.join(output_dir, f'{filename_3d}.png')
+    fig_3d.savefig(fig_3d_path, dpi=args.dpi, bbox_inches='tight', facecolor='white')
+    print(f"[SAVED] High-res 3D plot saved to: {fig_3d_path}")
+    print(f"        Resolution: {n_theta_3d}×{n_phi_3d} samples, {args.dpi} DPI")
+    plt.close(fig_3d)
+
+    # --- High-resolution 3D BSDF (optional, more samples, higher-quality image) ---
+    # This is computationally expensive. Balanced resolution for quality vs speed.
+    COMPUTE_HIGHRES = False  # Set to True for higher resolution (takes much longer)
+    
+    if COMPUTE_HIGHRES:
+        print('\nComputing high-resolution 3D BSDF (this may take longer)...')
+        n_theta_hr = 30   # increase polar sampling
+        n_phi_hr = 60     # increase azimuthal sampling  
+        print(f'  High-res sampling: {n_theta_hr} x {n_phi_hr} = {n_theta_hr*n_phi_hr} directions')
+        theta_hr, phi_hr, sigma_3d_tm_hr = solver_tm.compute_bsdf_3d(n_theta_hr, n_phi_hr, distance, verbose=True)
+        _, _, sigma_3d_te_hr = solver_te.compute_bsdf_3d(n_theta_hr, n_phi_hr, distance, verbose=True)
+        sigma_3d_hr_avg = (sigma_3d_tm_hr + sigma_3d_te_hr) / 2
+
+        # Create and save a larger, high-DPI 3D figure from high-res data
+        from matplotlib import cm
+        fig_hr = plt.figure(figsize=(14, 12))
+        ax_hr = fig_hr.add_subplot(111, projection='3d')
+        phi_mesh_hr, theta_mesh_hr = np.meshgrid(phi_hr, theta_hr)
+        d_theta_hr = np.pi / n_theta_hr
+        d_phi_hr = 2 * np.pi / n_phi_hr
+        pdf_3d_hr = sigma_3d_hr_avg / (np.sum(sigma_3d_hr_avg) * d_theta_hr * d_phi_hr)
+        # scale (normalize) for visualization
+        pdf_3d_hr_norm = pdf_3d_hr / np.max(pdf_3d_hr)
+        x_hr = pdf_3d_hr_norm * np.sin(theta_mesh_hr) * np.cos(phi_mesh_hr)
+        y_hr = pdf_3d_hr_norm * np.sin(theta_mesh_hr) * np.sin(phi_mesh_hr)
+        z_hr = pdf_3d_hr_norm * np.cos(theta_mesh_hr)
+        surf_hr = ax_hr.plot_surface(x_hr, y_hr, z_hr, rstride=1, cstride=1,
+                                     facecolors=cm.viridis(pdf_3d_hr / np.max(pdf_3d_hr)),
+                                     linewidth=0, antialiased=True)
+        ax_hr.set_title('3D Scattering PDF (High-res BEM)', fontsize=14)
+        ax_hr.set_xlabel('X')
+        ax_hr.set_ylabel('Y')
+        ax_hr.set_zlabel('Z')
+        ax_hr.view_init(elev=20, azim=45)
+        # Save high-res figure
+        highres_png = os.path.join(output_dir, f'{filename_base}_3d_highres.png')
+        fig_hr.savefig(highres_png, dpi=300, bbox_inches='tight')
+        print(f"[SAVED] High-res 3D PNG saved to: {highres_png}")
+        # Save high-res numerical data separately (large file)
+        highres_data = os.path.join(output_dir, f'{filename_base}_3d_highres_data.npz')
+        np.savez_compressed(highres_data,
+                            theta_hr=theta_hr,
+                            phi_hr=phi_hr,
+                        sigma_3d_tm_hr=sigma_3d_tm_hr,
+                        sigma_3d_te_hr=sigma_3d_te_hr,
+                        sigma_3d_hr_avg=sigma_3d_hr_avg)
+        print(f"[SAVED] High-res 3D data saved to: {highres_data}")
+    else:
+        print('\n[SKIPPED] High-resolution 3D computation (set COMPUTE_HIGHRES=True to enable)')
+
     
     print("\n" + "=" * 70)
     print("PLOTTING RESULTS")
@@ -290,9 +410,10 @@ def main():
     ax7.set_ylim(bottom=0)
     print("  [OK] Longitudinal PDF plotted with detailed analysis")
     
-    # 8. 3D Scattering Pattern (both theta and phi) - FROM BEM SOLUTION
+    # 8. 3D Scattering Pattern (both theta and phi) - FROM BEM SOLUTION (LARGER)
     print("  Creating 3D scattering plot from computed data...")
-    ax8 = fig.add_subplot(3, 3, 8, projection='3d')
+    # Make this plot span positions 8 and 9 (larger 3D plot)
+    ax8 = plt.subplot2grid((3, 3), (2, 1), colspan=2, projection='3d')
     
     from matplotlib import cm
     
@@ -318,17 +439,17 @@ def main():
                            facecolors=cm.viridis(pdf_3d / np.max(pdf_3d)))
     
     # Add cylinder at origin
-    ax8.plot([0], [0], [0], 'ro', markersize=8, label='Cylinder')
+    ax8.plot([0], [0], [0], 'ro', markersize=10, label='Cylinder')
     
-    ax8.set_xlabel('X', fontsize=10)
-    ax8.set_ylabel('Y', fontsize=10)
-    ax8.set_zlabel('Z', fontsize=10)
-    ax8.set_title('3D Scattering PDF\n(BEM computed)', fontsize=12, fontweight='bold')
+    ax8.set_xlabel('X', fontsize=11, fontweight='bold')
+    ax8.set_ylabel('Y', fontsize=11, fontweight='bold')
+    ax8.set_zlabel('Z', fontsize=11, fontweight='bold')
+    ax8.set_title('3D Scattering PDF (BEM computed)', fontsize=13, fontweight='bold', pad=15)
     ax8.view_init(elev=20, azim=45)
     print("  [OK] 3D scattering plot created from BEM data")
     
-    # 9. Statistics table
-    ax9 = plt.subplot(3, 3, 9)
+    # 9. Statistics table (moved to position 8, single column)
+    ax9 = plt.subplot(3, 3, 8)
     ax9.axis('off')
     
     # Calculate statistics
@@ -416,7 +537,8 @@ def main():
     print(f"Forward/Backward ratio: {forward_backward_ratio:.2f}")
     print("=" * 70)
     print("\n[SUCCESS] Simulation completed successfully!")
-    print(f"  Plot file: {plot_path}")
+    print(f"  Main plot: {plot_path}")
+    print(f"  3D plot:   {fig_3d_path}")
     print(f"  Data file: {data_path}")
     print(f"  Output directory: {output_dir}")
     print("=" * 70)
